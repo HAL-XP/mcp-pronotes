@@ -18,12 +18,15 @@ import logging
 import os
 import sys
 import time
-import traceback
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
 import pronotepy
+from auth import login_from_file, persist_credentials
+import communication
+import pedagogy
+import features
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp import types
@@ -37,6 +40,7 @@ logging.basicConfig(
     stream=sys.stderr,
 )
 logger = logging.getLogger("mcp-pronotes")
+logging.getLogger("pronotepy").setLevel(logging.WARNING)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -55,6 +59,7 @@ def _load_config() -> dict[str, str]:
             config["username"] = file_cfg.get("username", "")
             config["password"] = file_cfg.get("password", "")
             config["account_type"] = file_cfg.get("account_type", "parent")
+            config["login_file"] = file_cfg.get("login_file", "")
 
     # Environment variables take precedence
     if os.environ.get("PRONOTE_URL"):
@@ -65,6 +70,8 @@ def _load_config() -> dict[str, str]:
         config["password"] = os.environ["PRONOTE_PASSWORD"]
     if os.environ.get("PRONOTE_ACCOUNT_TYPE"):
         config["account_type"] = os.environ["PRONOTE_ACCOUNT_TYPE"]
+    if os.environ.get("PRONOTE_LOGIN_FILE"):
+        config["login_file"] = os.environ["PRONOTE_LOGIN_FILE"]
 
     return config
 
@@ -78,11 +85,13 @@ CONFIG = _load_config()
 _client: Optional[pronotepy.ParentClient | pronotepy.Client] = None
 _client_timestamp: float = 0.0
 _CLIENT_TTL = 25 * 60  # 25 minutes — Pronote sessions expire after ~30 min
+_credential_path: Optional[Path] = None
+_credential_options: dict[str, str] = {}
 
 
 def _get_client() -> pronotepy.ParentClient | pronotepy.Client:
     """Return a cached Pronote client, reconnecting if stale or missing."""
-    global _client, _client_timestamp
+    global _client, _client_timestamp, _credential_path, _credential_options
 
     now = time.time()
 
@@ -90,16 +99,33 @@ def _get_client() -> pronotepy.ParentClient | pronotepy.Client:
     if _client is not None and (now - _client_timestamp) < _CLIENT_TTL:
         try:
             _client.session_check()
-            return _client
         except Exception:
             logger.warning("Session check failed, reconnecting...")
             _client = None
+        else:
+            _persist_client_credentials()
+            return _client
 
     # Validate config
     url = CONFIG.get("url", "")
     username = CONFIG.get("username", "")
     password = CONFIG.get("password", "")
     account_type = CONFIG.get("account_type", "parent")
+
+    login_path = Path(CONFIG.get("login_file") or Path(__file__).parent / "login.json").expanduser()
+    if login_path.exists():
+        _client = None
+        _credential_path = None
+        _client, account_type, _credential_options = login_from_file(login_path, account_type)
+        _credential_path = login_path
+        CONFIG["account_type"] = account_type
+        _client_timestamp = time.time()
+        logger.info("Connected to Pronote using a local mobile token.")
+        return _client
+    if CONFIG.get("login_file"):
+        raise ValueError("The configured login file does not exist.")
+    _credential_path = None
+    _credential_options = {}
 
     if not url:
         raise ValueError(
@@ -111,7 +137,7 @@ def _get_client() -> pronotepy.ParentClient | pronotepy.Client:
             "Set them in config.json or as environment variables."
         )
 
-    logger.info("Connecting to Pronote as %s (%s)...", username, account_type)
+    logger.info("Connecting to Pronote with a %s account...", account_type)
 
     if account_type == "parent":
         _client = pronotepy.ParentClient(url, username=username, password=password)
@@ -121,6 +147,11 @@ def _get_client() -> pronotepy.ParentClient | pronotepy.Client:
     _client_timestamp = time.time()
     logger.info("Connected to Pronote successfully.")
     return _client
+
+
+def _persist_client_credentials() -> None:
+    if _client is not None and _credential_path is not None:
+        persist_credentials(_client, _credential_path, CONFIG.get("account_type", "student"), _credential_options)
 
 
 def _is_parent() -> bool:
@@ -143,8 +174,10 @@ def _select_child(client: pronotepy.ParentClient, child_name: Optional[str] = No
     if child_name:
         client.set_child(child_name)
         return child_name
-    # Default: first child (already selected on connection)
-    return client.children[0].name
+    # Reset a cached parent session to the documented default child.
+    name = client.children[0].name
+    client.set_child(name)
+    return name
 
 
 def _list_children_names(client: pronotepy.ParentClient) -> list[str]:
@@ -173,11 +206,13 @@ def _format_lesson(lesson: Any) -> dict[str, Any]:
 
 def _format_homework(hw: Any) -> dict[str, Any]:
     return {
+        "id": getattr(hw, "id", None),
         "subject": hw.subject.name if hw.subject else None,
         "description": hw.description,
         "due_date": hw.date.isoformat() if hw.date else None,
         "done": hw.done,
         "background_color": hw.background_color,
+        "attachments": [communication.attachment(item) for item in hw.files],
     }
 
 
@@ -404,7 +439,7 @@ async def list_tools() -> list[types.Tool]:
                 "additionalProperties": False,
             },
         ),
-    ]
+    ] + communication.TOOLS + pedagogy.TOOLS + features.TOOLS
 
 
 TOOL_HANDLERS = {
@@ -415,7 +450,7 @@ TOOL_HANDLERS = {
     "get_student_info",
     "get_averages",
     "get_menus",
-}
+} | {tool.name for tool in communication.TOOLS + pedagogy.TOOLS + features.TOOLS}
 
 
 @app.call_tool()
@@ -424,6 +459,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
         return _error_result(f"Unknown tool: {name}")
 
     try:
+        features.authorize(name, arguments)
         client = _get_client()
 
         # Select child if parent account
@@ -432,6 +468,13 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
             selected = _select_child(client, child_name)
         else:
             selected = None
+
+        if name in {tool.name for tool in communication.TOOLS}:
+            return _json_result(communication.handle(name, client, arguments, selected))
+        if name in {tool.name for tool in pedagogy.TOOLS}:
+            return _json_result(pedagogy.handle(name, client, arguments, selected))
+        if name in {tool.name for tool in features.TOOLS}:
+            return _json_result(features.handle(name, client, arguments, selected, _find_period))
 
         if name == "get_timetable":
             return await _handle_timetable(client, arguments, selected)
@@ -451,25 +494,38 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
             return _error_result(f"Unknown tool: {name}")  # unreachable
 
     except pronotepy.ENTLoginError as e:
-        logger.error("ENT login error: %s", e)
-        return _error_result(f"ENT authentication failed: {e}")
-    except pronotepy.PronoteAPIError as e:
-        logger.error("Pronote API error: %s", e)
-        return _error_result(f"Pronote API error: {e}")
+        logger.error("ENT authentication failed.")
+        return _error_result("ENT authentication failed.")
     except pronotepy.CryptoError as e:
-        logger.error("Pronote crypto/auth error: %s", e)
+        logger.error("Pronote crypto/authentication failed.")
         global _client
         _client = None  # Force reconnect on next call
-        return _error_result(f"Authentication error (bad password or session expired): {e}")
+        return _error_result("Authentication error. Check the QR PIN or generate a fresh QR code.")
     except pronotepy.ChildNotFound as e:
         logger.error("Child not found: %s", e)
         return _error_result(f"Child not found: {e}")
+    except pronotepy.PronoteAPIError as e:
+        logger.error("Pronote API error of type %s.", type(e).__name__)
+        message = "Pronote API error. This section may be unavailable or the session may have expired."
+        if name in features.WRITES:
+            message += " The action may have succeeded. Verify in PRONOTE before retrying."
+        return _error_result(message)
     except ValueError as e:
         logger.error("Configuration error: %s", e)
         return _error_result(str(e))
     except Exception as e:
-        logger.error("Unexpected error in %s: %s\n%s", name, e, traceback.format_exc())
-        return _error_result(f"Unexpected error: {e}")
+        logger.error("Unexpected error in %s of type %s.", name, type(e).__name__)
+        message = f"Unexpected error of type {type(e).__name__}."
+        if name in features.WRITES:
+            message += " The action may have succeeded. Verify in PRONOTE before retrying."
+        return _error_result(message)
+    finally:
+        # PRONOTE can rotate tokens during automatic session refreshes.
+        try:
+            _persist_client_credentials()
+        except Exception:
+            logger.error("Could not store the rotated PRONOTE token.")
+            raise RuntimeError("Could not store the rotated PRONOTE token. Check login-file permissions.") from None
 
 
 # ---------------------------------------------------------------------------
@@ -628,6 +684,9 @@ async def _handle_student_info(
         result["children"] = children_info
     else:
         result["logged_in"] = True
+        result["name"] = client.info.name
+        result["class"] = client.info.class_name
+        result["school"] = client.info.establishment
 
     # Periods
     periods_info = []

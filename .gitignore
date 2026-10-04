@@ -1,5 +1,11 @@
-# Credentials — never commit
+# Credentials. Never commit these files.
 config.json
+login.json
+credentials.json
+.env
+.env.*
+.pronote-login-*
+downloads/
 
 # Python
 __pycache__/
