@@ -55,6 +55,9 @@ def _load_config() -> dict[str, str]:
             config["username"] = file_cfg.get("username", "")
             config["password"] = file_cfg.get("password", "")
             config["account_type"] = file_cfg.get("account_type", "parent")
+            config["ent"] = file_cfg.get("ent", "")
+            config["auth_mode"] = file_cfg.get("auth_mode", "")
+            config["uuid"] = file_cfg.get("uuid", "")
 
     # Environment variables take precedence
     if os.environ.get("PRONOTE_URL"):
@@ -65,6 +68,8 @@ def _load_config() -> dict[str, str]:
         config["password"] = os.environ["PRONOTE_PASSWORD"]
     if os.environ.get("PRONOTE_ACCOUNT_TYPE"):
         config["account_type"] = os.environ["PRONOTE_ACCOUNT_TYPE"]
+    if os.environ.get("PRONOTE_ENT"):
+        config["ent"] = os.environ["PRONOTE_ENT"]
 
     return config
 
@@ -111,12 +116,42 @@ def _get_client() -> pronotepy.ParentClient | pronotepy.Client:
             "Set them in config.json or as environment variables."
         )
 
-    logger.info("Connecting to Pronote as %s (%s)...", username, account_type)
+    auth_mode = CONFIG.get("auth_mode", "")
+    device_uuid = CONFIG.get("uuid", "")
 
-    if account_type == "parent":
-        _client = pronotepy.ParentClient(url, username=username, password=password)
+    if auth_mode == "token" and device_uuid:
+        # Token-based login (from QR code, bypasses ENT)
+        logger.info("Connecting to Pronote as %s via token login...", username)
+        if account_type == "parent":
+            _client = pronotepy.ParentClient.token_login(
+                url, username, password, device_uuid
+            )
+        else:
+            _client = pronotepy.Client.token_login(
+                url, username, password, device_uuid
+            )
     else:
-        _client = pronotepy.Client(url, username=username, password=password)
+        # ENT or direct login
+        ent_name = CONFIG.get("ent", "")
+        ent_func = None
+        if ent_name:
+            try:
+                import pronotepy.ent as ent_module
+                ent_func = getattr(ent_module, ent_name, None)
+                if ent_func is None:
+                    logger.warning("ENT function '%s' not found, trying direct login", ent_name)
+            except ImportError:
+                logger.warning("pronotepy.ent not available, trying direct login")
+
+        logger.info("Connecting to Pronote as %s (%s)%s...", username, account_type,
+                    f" via ENT {ent_name}" if ent_func else "")
+
+        if account_type == "parent":
+            _client = pronotepy.ParentClient(url, username=username, password=password,
+                                              ent=ent_func if ent_func else None)
+        else:
+            _client = pronotepy.Client(url, username=username, password=password,
+                                        ent=ent_func if ent_func else None)
 
     _client_timestamp = time.time()
     logger.info("Connected to Pronote successfully.")
